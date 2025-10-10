@@ -1,0 +1,1 @@
+This a fully programmable bipolar stepper motor controller.  It has a 0-10 VDC analog input as well as two option switches and two push buttons for manually driving the motor.  V2.0 requires an external power supply for the stepper motor DC voltage.  
