@@ -1,0 +1,197 @@
+#include <AccelStepper.h>
+
+#define STEPS 6386
+#define OVERDRIVE 20
+
+AccelStepper stepper(AccelStepper::FULL4WIRE, 9, 10, 11, 12);
+
+const int analogPin = A2;
+const int btnOpenPin = 6;
+const int btnClosePin = 7;
+const int manualOverridePin = 2; // when LOW -> manual override ON
+const int futureSwitchPin = 3;   // unused
+const int ledPin = 13;
+
+const unsigned long ANALOG_INTERVAL = 15000UL; // 10s between analog reads
+const unsigned long ENSURE_INTERVAL  = 60000UL; // 60s ensure open/close overdrive when at extremes
+
+const float MANUAL_SPEED = 400.0f; // steps/sec when holding button in manual override (adjust as needed)
+const float MAX_SPEED = 400.0f;    // max speed for automatic moves (steps/sec)
+const float ACCEL = 400.0f;       // acceleration (steps/sec^2) for smooth motion
+
+long targetPosition = 0L;
+long lastMappedTarget = 0L;
+int lastAnalogValue = -1;
+unsigned long lastAnalogMillis = 0;
+unsigned long lastEnsureOpenMillis = 0;
+unsigned long lastEnsureCloseMillis = 0;
+bool waitingForOverdriveCompletion = false;
+
+void performStartUp() {
+  Serial.println("Performing Startup: Driving valve fully closed...");
+
+  stepper.setSpeed(-250); // increase speed for full travel
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 30000) {  // slightly more than full travel
+    stepper.runSpeed();   // continuously steps
+  }
+
+  stepper.setCurrentPosition(0);
+  Serial.println("Startup complete. Valve fully closed.");
+}
+
+void performOverdriveClose() {
+  Serial.println("Performing overdrive CLOSE...");
+  stepper.moveTo(-OVERDRIVE);
+  waitingForOverdriveCompletion = true;
+}
+
+void performOverdriveOpen() {
+  Serial.println("Performing overdrive OPEN...");
+  stepper.moveTo(STEPS + OVERDRIVE);
+  waitingForOverdriveCompletion = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(btnOpenPin, INPUT);
+  pinMode(btnClosePin, INPUT);
+  pinMode(manualOverridePin, INPUT_PULLUP); // active LOW
+  pinMode(futureSwitchPin, INPUT_PULLUP);
+  pinMode(ledPin, OUTPUT);
+
+  stepper.setMaxSpeed(MAX_SPEED);
+  stepper.setAcceleration(ACCEL);
+  
+  targetPosition = 0;
+  lastMappedTarget = 0;
+  lastAnalogMillis = millis();
+  lastEnsureOpenMillis = millis();
+  lastEnsureCloseMillis = millis();
+
+  Serial.println("Valve controller starting...");
+  delay(50);
+
+  performStartUp();
+  delay(10);
+  performOverdriveClose();
+  delay(10);
+  stepper.setCurrentPosition(0);
+}
+
+unsigned long ledLast = 0;
+bool ledState = false;
+const unsigned long LED_INTERVAL = 500;
+
+void loop() {
+  unsigned long now = millis();
+
+  if (stepper.distanceToGo() != 0) {
+    digitalWrite(ledPin, HIGH); // motor is moving
+} else {
+    digitalWrite(ledPin, LOW);  // motor stopped
+}
+
+  bool manualOverride = (digitalRead(manualOverridePin) == LOW);
+
+  if (manualOverride) {
+    if (digitalRead(btnOpenPin) == LOW) {
+      stepper.setSpeed(MANUAL_SPEED);   // positive = open
+      stepper.runSpeed();
+    } 
+    else if (digitalRead(btnClosePin) == LOW) {
+      stepper.setSpeed(-MANUAL_SPEED);  // negative = close
+      stepper.runSpeed();
+    }
+  } 
+  else {
+    if (now - lastAnalogMillis >= ANALOG_INTERVAL) {
+      lastAnalogMillis = now;
+      int analogVal = analogRead(analogPin); // 0..1023
+      lastAnalogValue = analogVal;
+      Serial.print("Analog read: ");
+      Serial.println(analogVal);
+
+      if (analogVal < 50) {
+        // Only move to fully closed, do NOT trigger overdrive here
+        stepper.moveTo(0);
+        lastMappedTarget = 0;
+        Serial.println("Analog low: moving to fully closed (overdrive will happen via timer)");
+      }
+      else if (analogVal > 950) {
+        stepper.moveTo(STEPS);
+        lastMappedTarget = STEPS;
+        Serial.println("Analog high: moving to fully open (overdrive via timer)");
+      }
+      else {
+        // Map range 50..950 -> 0..STEPS
+        long mapped = map(analogVal, 50, 950, 0, STEPS);
+        mapped = constrain(mapped, 0, STEPS);
+        if (mapped != lastMappedTarget) {
+          Serial.print("Setting target (mapped): ");
+          Serial.println(mapped);
+          stepper.moveTo(mapped);
+          lastMappedTarget = mapped;
+        }
+      }
+    }
+
+    // Ensure overdrive every minute when at extremes
+    if (lastAnalogValue >= 950) {
+      if (!waitingForOverdriveCompletion && (now - lastEnsureOpenMillis >= ENSURE_INTERVAL)) {
+        lastEnsureOpenMillis = now;
+        performOverdriveOpen();
+      }
+    } 
+    else if (lastAnalogValue < 50) {
+      if (!waitingForOverdriveCompletion && (now - lastEnsureCloseMillis >= ENSURE_INTERVAL)) {
+        lastEnsureCloseMillis = now;
+        performOverdriveClose();
+      }
+    }
+
+    // Run stepper toward current target if any
+    if (waitingForOverdriveCompletion) {
+      if (stepper.distanceToGo() != 0) {
+        stepper.run();
+      } else {
+        long pos = stepper.currentPosition();
+        if (pos <= 0) {
+          stepper.setCurrentPosition(0);
+          targetPosition = 0;
+          lastMappedTarget = 0;
+          Serial.println("Overdrive CLOSE complete. Position reset to 0 (closed).");
+        } else if (pos >= STEPS) {
+          stepper.setCurrentPosition(STEPS);
+          targetPosition = STEPS;
+          lastMappedTarget = STEPS;
+          Serial.println("Overdrive OPEN complete. Position set to STEPS (open).");
+        } else {
+          Serial.print("Overdrive finished at pos: ");
+          Serial.println(pos);
+        }
+        waitingForOverdriveCompletion = false;
+      }
+    } 
+    else {
+      if (stepper.distanceToGo() != 0) {
+        stepper.run();
+      }
+    }
+  } // end automatic/manual
+
+  static bool printedAtTarget = false;
+  if (!waitingForOverdriveCompletion && stepper.distanceToGo() == 0) {
+    long pos = stepper.currentPosition();
+    if (!printedAtTarget) {
+      Serial.print("At position: ");
+      Serial.println(pos);
+      printedAtTarget = true;
+    }
+  } else {
+    printedAtTarget = false;
+  }
+
+  delay(1);
+}
